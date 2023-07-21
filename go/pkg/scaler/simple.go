@@ -73,7 +73,7 @@ func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.Ass
 	}()
 	log.Printf("Assign, request id: %s", request.RequestId)
 	s.mu.Lock()
-	if element := s.idleInstance.Front(); element != nil {
+	if element := s.idleInstance.Front(); element != nil { //从idleInstance队列中取第一个
 		instance := element.Value.(*model2.Instance)
 		instance.Busy = true
 		s.idleInstance.Remove(element)
@@ -91,6 +91,8 @@ func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.Ass
 		}, nil
 	}
 	s.mu.Unlock()
+
+	//没有找到合适的Instance，尝试创建一个Instance
 
 	//Create new Instance
 	resourceConfig := model2.SlotResourceConfig{
