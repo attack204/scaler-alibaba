@@ -38,6 +38,7 @@ type Simple struct {
 	wg             sync.WaitGroup
 	instances      map[string]*model2.Instance
 	idleInstance   *list.List
+	hotInstance    *list.List //永不释放
 }
 
 func New(metaData *model2.Meta, config *config.Config) Scaler {
@@ -53,6 +54,7 @@ func New(metaData *model2.Meta, config *config.Config) Scaler {
 		wg:             sync.WaitGroup{},
 		instances:      make(map[string]*model2.Instance),
 		idleInstance:   list.New(),
+		hotInstance:    list.New(),
 	}
 	log.Printf("New scaler for app: %s is created", metaData.Key)
 	scheduler.wg.Add(1)
@@ -67,12 +69,14 @@ func New(metaData *model2.Meta, config *config.Config) Scaler {
 
 func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.AssignReply, error) {
 	start := time.Now()
-	instanceId := uuid.New().String()
+	instanceId := uuid.New().String() //instanceId是由时间戳生成的
 	defer func() {
 		log.Printf("Assign, request id: %s, instance id: %s, cost %dms", request.RequestId, instanceId, time.Since(start).Milliseconds())
 	}()
 	log.Printf("Assign, request id: %s", request.RequestId)
 	s.mu.Lock()
+
+	//0. 尝试从idleInstance中获取，能获取到就直接返回
 	if element := s.idleInstance.Front(); element != nil { //从idleInstance队列中取第一个
 		instance := element.Value.(*model2.Instance)
 		instance.Busy = true
@@ -94,12 +98,13 @@ func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.Ass
 
 	//没有找到合适的Instance，尝试创建一个Instance
 
-	//Create new Instance
+	//1. 首先创建一个slot
 	resourceConfig := model2.SlotResourceConfig{
 		ResourceConfig: pb.ResourceConfig{
 			MemoryInMegabytes: request.MetaData.MemoryInMb,
 		},
 	}
+	//创建slot只需要填写requestId和resourceConfig参数
 	slot, err := s.platformClient.CreateSlot(ctx, request.RequestId, &resourceConfig)
 	if err != nil {
 		errorMessage := fmt.Sprintf("create slot failed with: %s", err.Error())
@@ -107,6 +112,7 @@ func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.Ass
 		return nil, status.Errorf(codes.Internal, errorMessage)
 	}
 
+	//2. 创建一个instance
 	meta := &model2.Meta{
 		Meta: pb.Meta{
 			Key:           request.MetaData.Key,
@@ -120,8 +126,7 @@ func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.Ass
 		log.Printf(errorMessage)
 		return nil, status.Errorf(codes.Internal, errorMessage)
 	}
-
-	//add new instance
+	//更新instance信息
 	s.mu.Lock()
 	instance.Busy = true
 	s.instances[instance.Id] = instance
@@ -139,6 +144,15 @@ func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.Ass
 	}, nil
 }
 
+/*
+Idle的用途
+1. 如果needDestroy == true，那么删除slot，不会加入idleInstance
+2. 如果instance.Busy == false，按么什么都不会做
+3. 如果instance.Busy == true
+	设置instance.Busy = false
+	添加回idleInstance队列
+*/
+
 func (s *Simple) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.IdleReply, error) {
 	if request.Assigment == nil {
 		return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("assignment is nil"))
@@ -152,7 +166,7 @@ func (s *Simple) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.IdleRep
 	defer func() {
 		log.Printf("Idle, request id: %s, instance: %s, cost %dus", request.Assigment.RequestId, instanceId, time.Since(start).Microseconds())
 	}()
-	//log.Printf("Idle, request id: %s", request.Assigment.RequestId)
+	log.Printf("Idle, request id: %s", request.Assigment.RequestId)
 	needDestroy := false
 	slotId := ""
 	if request.Result != nil && request.Result.NeedDestroy != nil && *request.Result.NeedDestroy {
@@ -204,7 +218,7 @@ func (s *Simple) gcLoop() {
 			s.mu.Lock()
 			if element := s.idleInstance.Back(); element != nil {
 				instance := element.Value.(*model2.Instance)
-				idleDuration := time.Now().Sub(instance.LastIdleTime)
+				idleDuration := time.Now().Sub(instance.LastIdleTime) //通过当前时间 - LastIdleTime计算出空闲时间
 				if idleDuration > s.config.IdleDurationBeforeGC {
 					//need GC
 					s.idleInstance.Remove(element)

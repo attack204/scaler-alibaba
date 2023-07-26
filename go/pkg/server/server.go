@@ -48,8 +48,13 @@ func (s *Server) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.Ass
 			TimeoutInSecs: request.MetaData.TimeoutInSecs,
 		},
 	}
-	scheduler := s.mgr.GetOrCreate(metaData)
-	return scheduler.Assign(ctx, request)
+	master := s.mgr
+	scheduler, _ := master.GetOrCreate(metaData)
+	reply, err := scheduler.Assign(ctx, request)
+
+	master.RequestReply[request.RequestId] = reply.Assigment
+	//window.Append(request.Timestamp, 0)
+	return reply, err
 }
 
 func (s *Server) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.IdleReply, error) {
