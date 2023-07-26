@@ -37,6 +37,7 @@ type Simple struct {
 	mu             sync.Mutex
 	wg             sync.WaitGroup
 	instances      map[string]*model2.Instance
+	window         MyWindow
 	idleInstance   *list.List
 	hotInstance    *list.List //永不释放
 }
@@ -55,7 +56,14 @@ func New(metaData *model2.Meta, config *config.Config) Scaler {
 		instances:      make(map[string]*model2.Instance),
 		idleInstance:   list.New(),
 		hotInstance:    list.New(),
+		window: MyWindow{ // 将 Window 字段的类型修改为指向 MyWindow 的指针
+			Threshold:     1000,              // 初始化 Threshold 字段为 1000
+			Time:          make([]uint64, 1), // 初始化 Time 字段为一个新的双向链表
+			ConcurrentNum: make([]int, 1),    // 初始化 Concurrent 字段为一个新的双向链表
+			ActiveRequest: make(map[string]bool),
+		},
 	}
+
 	log.Printf("New scaler for app: %s is created", metaData.Key)
 	scheduler.wg.Add(1)
 	go func() {
@@ -75,6 +83,8 @@ func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.Ass
 	}()
 	log.Printf("Assign, request id: %s", request.RequestId)
 	s.mu.Lock()
+
+	s.window.Append(request)
 
 	//0. 尝试从idleInstance中获取，能获取到就直接返回
 	if element := s.idleInstance.Front(); element != nil { //从idleInstance队列中取第一个
@@ -161,6 +171,7 @@ func (s *Simple) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.IdleRep
 		Status:       pb.Status_Ok,
 		ErrorMessage: nil,
 	}
+	delete(s.window.ActiveRequest, request.Assigment.RequestId)
 	start := time.Now()
 	instanceId := request.Assigment.InstanceId
 	defer func() {

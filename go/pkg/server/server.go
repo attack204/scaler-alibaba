@@ -49,11 +49,8 @@ func (s *Server) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.Ass
 		},
 	}
 	master := s.mgr
-	scheduler, _ := master.GetOrCreate(metaData)
+	scheduler := master.GetOrCreate(metaData)
 	reply, err := scheduler.Assign(ctx, request)
-
-	master.RequestReply[request.RequestId] = reply.Assigment
-	//window.Append(request.Timestamp, 0)
 	return reply, err
 }
 
