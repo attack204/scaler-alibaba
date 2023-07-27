@@ -82,11 +82,10 @@ func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.Ass
 		log.Printf("Assign, request id: %s, instance id: %s, cost %dms", request.RequestId, instanceId, time.Since(start).Milliseconds())
 	}()
 	log.Printf("Assign, request id: %s", request.RequestId)
-	s.mu.Lock()
-
 	s.window.Append(request)
 
 	//0. 尝试从idleInstance中获取，能获取到就直接返回
+	s.mu.Lock()
 	if element := s.idleInstance.Front(); element != nil { //从idleInstance队列中取第一个
 		instance := element.Value.(*model2.Instance)
 		instance.Busy = true
@@ -109,38 +108,35 @@ func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.Ass
 	//没有找到合适的Instance，尝试创建一个Instance
 
 	//1. 首先创建一个slot
-	resourceConfig := model2.SlotResourceConfig{
-		ResourceConfig: pb.ResourceConfig{
-			MemoryInMegabytes: request.MetaData.MemoryInMb,
-		},
-	}
-	//创建slot只需要填写requestId和resourceConfig参数
-	slot, err := s.platformClient.CreateSlot(ctx, request.RequestId, &resourceConfig)
+	slot, err := s.createSlot(ctx, request)
 	if err != nil {
-		errorMessage := fmt.Sprintf("create slot failed with: %s", err.Error())
-		log.Printf(errorMessage)
-		return nil, status.Errorf(codes.Internal, errorMessage)
+		return nil, err
 	}
 
 	//2. 创建一个instance
-	meta := &model2.Meta{
-		Meta: pb.Meta{
-			Key:           request.MetaData.Key,
-			Runtime:       request.MetaData.Runtime,
-			TimeoutInSecs: request.MetaData.TimeoutInSecs,
-		},
-	}
-	instance, err := s.platformClient.Init(ctx, request.RequestId, instanceId, slot, meta)
+	instance, err := s.createInstance(ctx, request, instanceId, slot)
 	if err != nil {
-		errorMessage := fmt.Sprintf("create instance failed with: %s", err.Error())
-		log.Printf(errorMessage)
-		return nil, status.Errorf(codes.Internal, errorMessage)
+		return nil, err
 	}
-	//更新instance信息
-	s.mu.Lock()
-	instance.Busy = true
-	s.instances[instance.Id] = instance
-	s.mu.Unlock()
+
+	//3. 判断是否要预先申请机器
+	num := s.window.Judge()
+	if num > 0 {
+		for i := 0; i < num; i++ {
+			pre_slot, err := s.createSlot(ctx, request)
+			if err != nil {
+				return nil, err
+			}
+			pre_instance, err := s.createInstance(ctx, request, instanceId, slot)
+			if err != nil {
+				return nil, err
+			}
+			log.Printf("request id: %s, pre_slot %s", request.RequestId, pre_slot.Id)
+			log.Printf("request id: %s, pre_instance %s for app %s is created", request.RequestId, pre_instance.Id, pre_instance.Meta.Key)
+
+		}
+	}
+
 	log.Printf("request id: %s, instance %s for app %s is created, init latency: %dms", request.RequestId, instance.Id, instance.Meta.Key, instance.InitDurationInMs)
 
 	return &pb.AssignReply{
@@ -259,4 +255,42 @@ func (s *Simple) Stats() Stats {
 		TotalInstance:     len(s.instances),
 		TotalIdleInstance: s.idleInstance.Len(),
 	}
+}
+
+func (s *Simple) createSlot(ctx context.Context, request *pb.AssignRequest) (*model2.Slot, error) {
+	resourceConfig := model2.SlotResourceConfig{
+		ResourceConfig: pb.ResourceConfig{
+			MemoryInMegabytes: request.MetaData.MemoryInMb,
+		},
+	}
+	//创建slot只需要填写requestId和resourceConfig参数
+	slot, err := s.platformClient.CreateSlot(ctx, request.RequestId, &resourceConfig)
+	if err != nil {
+		errorMessage := fmt.Sprintf("create slot failed with: %s", err.Error())
+		log.Printf(errorMessage)
+		return nil, status.Errorf(codes.Internal, errorMessage)
+	}
+	return slot, err
+}
+
+func (s *Simple) createInstance(ctx context.Context, request *pb.AssignRequest, instanceId string, slot *model2.Slot) (*model2.Instance, error) {
+	meta := &model2.Meta{
+		Meta: pb.Meta{
+			Key:           request.MetaData.Key,
+			Runtime:       request.MetaData.Runtime,
+			TimeoutInSecs: request.MetaData.TimeoutInSecs,
+		},
+	}
+	instance, err := s.platformClient.Init(ctx, request.RequestId, instanceId, slot, meta)
+	if err != nil {
+		errorMessage := fmt.Sprintf("create instance failed with: %s", err.Error())
+		log.Printf(errorMessage)
+		return nil, status.Errorf(codes.Internal, errorMessage)
+	}
+	//更新instance信息
+	s.mu.Lock()
+	instance.Busy = true
+	s.instances[instance.Id] = instance
+	s.mu.Unlock()
+	return instance, err
 }

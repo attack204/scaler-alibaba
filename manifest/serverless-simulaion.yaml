@@ -16,7 +16,8 @@ spec:
       - name: scaler
         #  需要替换为选手实现的scaler镜像地址
         #  registry.cn-beijing.aliyuncs.com/cloudnative-challenge/scaler:java-v1.0为java语言的demo镜像
-        image: registry-vpc.cn-beijing.aliyuncs.com/gaojiliu-competition/scaler:v1.1
+        image: registry-vpc.cn-beijing.aliyuncs.com/gaojiliu-competition/scaler:$IMAGE_TAG
+        imagePullPolicy: Always
         command: ["./run.sh"]
       - name: serverless-simulator
         image: registry-vpc.cn-beijing.aliyuncs.com/gaojiliu-competition/simulator:v1.3.2
@@ -26,3 +27,4 @@ spec:
         args: ["function_smoke_test"]
       imagePullSecrets:
         - name: regcred
+
