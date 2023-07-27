@@ -1,7 +1,7 @@
 # Use a multi-stage build to keep the final image size small.
 # In the first stage, we'll use the official Go image to build the binary.
-# FROM golang:1.17.1 as builder
-FROM registry.cn-beijing.aliyuncs.com/cloudnative-challenge/golang:1.17.1 as builder
+FROM golang:1.20.5 as builder
+#FROM registry.cn-beijing.aliyuncs.com/cloudnative-challenge/golang:1.17.1 as builder
 
 # Set the working directory to /build.
 WORKDIR /build

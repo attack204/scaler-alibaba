@@ -24,6 +24,7 @@ import (
 	"google.golang.org/grpc/status"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pb "github.com/AliyunContainerService/scaler/proto"
@@ -39,7 +40,6 @@ type Simple struct {
 	instances      map[string]*model2.Instance
 	window         MyWindow
 	idleInstance   *list.List
-	hotInstance    *list.List //永不释放
 }
 
 func New(metaData *model2.Meta, config *config.Config) Scaler {
@@ -55,12 +55,11 @@ func New(metaData *model2.Meta, config *config.Config) Scaler {
 		wg:             sync.WaitGroup{},
 		instances:      make(map[string]*model2.Instance),
 		idleInstance:   list.New(),
-		hotInstance:    list.New(),
 		window: MyWindow{ // 将 Window 字段的类型修改为指向 MyWindow 的指针
-			Threshold:     1000,              // 初始化 Threshold 字段为 1000
-			Time:          make([]uint64, 1), // 初始化 Time 字段为一个新的双向链表
-			ConcurrentNum: make([]int, 1),    // 初始化 Concurrent 字段为一个新的双向链表
-			ActiveRequest: make(map[string]bool),
+			Threshold:      1000,              // 初始化 Threshold 字段为 1000
+			TimeList:       make([]uint64, 1), // 初始化 Time 字段为一个新的双向链表
+			ConcurrentList: make([]int32, 1),  // 初始化 Concurrent 字段为一个新的双向链表
+			ConNum:         atomic.Int32{},
 		},
 	}
 
@@ -85,57 +84,24 @@ func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.Ass
 	s.window.Append(request)
 
 	//0. 尝试从idleInstance中获取，能获取到就直接返回
-	s.mu.Lock()
-	if element := s.idleInstance.Front(); element != nil { //从idleInstance队列中取第一个
-		instance := element.Value.(*model2.Instance)
-		instance.Busy = true
-		s.idleInstance.Remove(element)
-		s.mu.Unlock()
-		log.Printf("Assign, request id: %s, instance %s reused", request.RequestId, instance.Id)
-		instanceId = instance.Id
-		return &pb.AssignReply{
-			Status: pb.Status_Ok,
-			Assigment: &pb.Assignment{
-				RequestId:  request.RequestId,
-				MetaKey:    instance.Meta.Key,
-				InstanceId: instance.Id,
-			},
-			ErrorMessage: nil,
-		}, nil
+	replay, err := s.getIdleInstance(request, &instanceId)
+	if replay != nil {
+		return replay, nil
 	}
-	s.mu.Unlock()
 
 	//没有找到合适的Instance，尝试创建一个Instance
-
 	//1. 首先创建一个slot
 	slot, err := s.createSlot(ctx, request)
 	if err != nil {
 		return nil, err
 	}
-
 	//2. 创建一个instance
 	instance, err := s.createInstance(ctx, request, instanceId, slot)
 	if err != nil {
 		return nil, err
 	}
-
 	//3. 判断是否要预先申请机器
-	num := s.window.Judge()
-	if num > 0 {
-		for i := 0; i < num; i++ {
-			pre_slot, err := s.createSlot(ctx, request)
-			if err != nil {
-				return nil, err
-			}
-			pre_instance, err := s.createInstance(ctx, request, instanceId, slot)
-			if err != nil {
-				return nil, err
-			}
-			log.Printf("request id: %s, pre_slot %s", request.RequestId, pre_slot.Id)
-			log.Printf("request id: %s, pre_instance %s for app %s is created", request.RequestId, pre_instance.Id, pre_instance.Meta.Key)
-
-		}
-	}
+	s.preAllocate(ctx, request)
 
 	log.Printf("request id: %s, instance %s for app %s is created, init latency: %dms", request.RequestId, instance.Id, instance.Meta.Key, instance.InitDurationInMs)
 
@@ -167,7 +133,7 @@ func (s *Simple) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.IdleRep
 		Status:       pb.Status_Ok,
 		ErrorMessage: nil,
 	}
-	delete(s.window.ActiveRequest, request.Assigment.RequestId)
+	s.window.ConNum.Add(-1)
 	start := time.Now()
 	instanceId := request.Assigment.InstanceId
 	defer func() {
@@ -200,7 +166,7 @@ func (s *Simple) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.IdleRep
 			return reply, nil
 		}
 		instance.Busy = false
-		s.idleInstance.PushFront(instance)
+		s.addIdleInstance(instance)
 	} else {
 		return nil, status.Errorf(codes.NotFound, fmt.Sprintf("request id %s, instance %s not found", request.Assigment.RequestId, instanceId))
 	}
@@ -293,4 +259,49 @@ func (s *Simple) createInstance(ctx context.Context, request *pb.AssignRequest, 
 	s.instances[instance.Id] = instance
 	s.mu.Unlock()
 	return instance, err
+}
+func (s *Simple) getIdleInstance(request *pb.AssignRequest, instanceId *string) (*pb.AssignReply, error) {
+	s.mu.Lock()
+	if element := s.idleInstance.Front(); element != nil { //从idleInstance队列中取第一个
+		instance := element.Value.(*model2.Instance)
+		instance.Busy = true
+		s.idleInstance.Remove(element)
+		s.mu.Unlock()
+		log.Printf("Assign, request id: %s, instance %s reused", request.RequestId, instance.Id)
+		instanceId = &instance.Id
+		return &pb.AssignReply{
+			Status: pb.Status_Ok,
+			Assigment: &pb.Assignment{
+				RequestId:  request.RequestId,
+				MetaKey:    instance.Meta.Key,
+				InstanceId: instance.Id,
+			},
+			ErrorMessage: nil,
+		}, nil
+	}
+	s.mu.Unlock()
+	return nil, nil
+}
+func (s *Simple) preAllocate(ctx context.Context, request *pb.AssignRequest) error {
+	num := s.window.Judge()
+	if num > 0 {
+		for i := 0; i < int(num); i++ {
+			instanceId := uuid.New().String() //instanceId是由时间戳生成的
+			pre_slot, err := s.createSlot(ctx, request)
+			if err != nil {
+				return err
+			}
+			pre_instance, err := s.createInstance(ctx, request, instanceId, pre_slot)
+			if err != nil {
+				return err
+			}
+			s.addIdleInstance(pre_instance)
+			log.Printf("request id: %s, pre_slot %s", request.RequestId, pre_slot.Id)
+			log.Printf("request id: %s, pre_instance %s for app %s is created", request.RequestId, pre_instance.Id, pre_instance.Meta.Key)
+		}
+	}
+	return nil
+}
+func (s *Simple) addIdleInstance(instance *model2.Instance) {
+	s.idleInstance.PushFront(instance)
 }
